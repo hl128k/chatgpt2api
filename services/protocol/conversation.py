@@ -388,8 +388,8 @@ class MessageStream:
     只有消息被改写、或者换了另一条消息时，才需要和已发文本做对齐。
 
     `shadow` 用于并行变体：上游可能为同一轮同时生成两条内容几乎相同的消息（见
-    `variant_purpose`），其中一条的内容一旦和已发文本完全重合，就把整条消息忽略掉，
-    否则两份答案会交替追加进同一个输出里。
+    `variant_purpose`）。本轮一旦锁定主消息，其余 id 整条忽略，否则两份答案会交替追加
+    进同一个输出里。
     """
 
     message_id: str = ""
@@ -397,8 +397,6 @@ class MessageStream:
     text: str = ""
     tail_confirmed: bool = False
     shadow: bool = False
-    suspect: bool = False
-    emitted_chars: int = 0
 
 
 @dataclass
@@ -477,7 +475,6 @@ def common_prefix_length(left: str, right: str) -> int:
 
 
 MIN_CONTAINED_LENGTH = 4
-MIN_VARIANT_SNAPSHOT_LENGTH = 8
 ANCHOR_PROBE_SIZES = (64, 32, 16, 8)
 
 
@@ -575,32 +572,6 @@ def log_stream_variant(state: ConversationState, stream: MessageStream,
         })
     except Exception:
         pass
-
-
-def log_stream_suspect(state: ConversationState, stream: MessageStream,
-                       snapshot: str, emitted: str) -> None:
-    """记录一条「内容已经发过、暂时不知道是变体还是重新生成」的消息。"""
-    try:
-        logger.debug({
-            "event": "stream_text_variant_suspect",
-            "message_id": stream.message_id,
-            "conversation_id": state.conversation_id,
-            "snapshot_length": len(snapshot),
-            "emitted_length": len(emitted),
-        })
-    except Exception:
-        pass
-
-
-def shadow_pending_streams(state: ConversationState, streams: dict[str, MessageStream],
-                           active: MessageStream) -> None:
-    """有消息正在产出新内容，说明之前挂起的那条是并行变体，整条丢掉。"""
-    for other in streams.values():
-        if other is active or not other.suspect:
-            continue
-        other.suspect = False
-        other.shadow = True
-        log_stream_variant(state, other, other.text, state.text)
 
 
 def sanitize_output_text(text: str) -> str:
@@ -848,6 +819,7 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
     history_index = 0
     streams: dict[str, MessageStream] = {}
     current_message = ""
+    primary_message: str | None = None
     for payload in payloads:
         # print(f"[upstream_sse] {payload}", flush=True)
         if not payload:
@@ -869,15 +841,17 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
             history_index += 1
             streams.clear()
             current_message = ""
+            primary_message = None
             state.text = ""
             continue
         message_id = event_assistant_message_id(event)
         if message_id:
             current_message = message_id
-        stream = streams.get(current_message)
+        stream_key = current_message
+        stream = streams.get(stream_key)
         if stream is None:
-            stream = MessageStream(message_id=current_message)
-            streams[current_message] = stream
+            stream = MessageStream(message_id=stream_key)
+            streams[stream_key] = stream
         next_raw_text = assistant_raw_text(event, stream.raw, history_text)
         next_text = sanitize_output_text(next_raw_text)
         stream.raw = next_raw_text
@@ -887,16 +861,15 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
 
         emitted_text = state.text
         if (
-            not stream.suspect
-            and stream.emitted_chars == 0
-            and len(next_text) >= MIN_VARIANT_SNAPSHOT_LENGTH
+            primary_message is not None
+            and stream_key != primary_message
             and config.stream_variant_policy == "follow_first"
-            and emitted_prefix_length(emitted_text, next_text) >= len(next_text)
         ):
-            # 这条消息的内容已经完整发过了：可能只是并行变体，也可能是一次「重新生成」。
-            # 先挂起不输出，等下一帧再判断——期间若另一条消息还在产出，它就是变体。
-            stream.suspect = True
-            log_stream_suspect(state, stream, next_text, emitted_text)
+            # 本轮已经锁定了一条消息，其他 id 是上游并行生成的变体：整条忽略。
+            stream.shadow = True
+            log_stream_variant(state, stream, next_text, emitted_text)
+            yield conversation_base_event("conversation.event", state, raw=event)
+            continue
 
         if stream.tail_confirmed and next_text.startswith(stream.text):
             # 同一条消息在变长，而且客户端当前的结尾正是这条消息上一次的快照：
@@ -910,11 +883,10 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
             log_stream_join(state, stream, next_text, emitted_text, covered)
         stream.text = next_text
         if delta:
-            # 它开始产出新内容了，说明之前只是「还没写完」，不是变体。
-            stream.suspect = False
-            shadow_pending_streams(state, streams, stream)
+            if primary_message is None:
+                # 第一条真正产出内容的消息就是本轮的主消息。
+                primary_message = stream_key
             state.text = emitted_text + delta
-            stream.emitted_chars += len(delta)
         stream.tail_confirmed = state.text.endswith(next_text)
         if delta:
             yield conversation_base_event("conversation.delta", state, raw=event, delta=delta)

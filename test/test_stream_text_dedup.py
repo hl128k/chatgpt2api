@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from contextlib import contextmanager
 
 from services.config import config
 from services.protocol.conversation import (
@@ -9,6 +10,19 @@ from services.protocol.conversation import (
     iter_conversation_payloads,
     normalize_messages,
 )
+
+
+@contextmanager
+def variant_policy(value: str):
+    original = config.data.get("stream_variant_policy")
+    config.data["stream_variant_policy"] = value
+    try:
+        yield
+    finally:
+        if original is None:
+            config.data.pop("stream_variant_policy", None)
+        else:
+            config.data["stream_variant_policy"] = original
 
 
 def append_event(text: str) -> str:
@@ -46,7 +60,8 @@ class StreamTextDedupTests(unittest.TestCase):
             payloads.append(message_event(answer[:end], "msg-new"))
         payloads.append("[DONE]")
 
-        self.assertEqual(collect_deltas(payloads), answer)
+        with variant_policy("merge"):
+            self.assertEqual(collect_deltas(payloads), answer)
 
     def test_parallel_variant_is_shadowed(self) -> None:
         # 上游 variant_purpose=comparison_implicit 会并行生成两条高度相似的消息，
@@ -82,7 +97,8 @@ class StreamTextDedupTests(unittest.TestCase):
         retake = "## 二、实际生图能力差多少？\n\n少爷，我查到一份 AMD 发布的官方测试，比较适合判断能做什么。"
         payloads = [message_event(first, "msg-1"), message_event(retake, "msg-2"), "[DONE]"]
 
-        output = collect_deltas(payloads)
+        with variant_policy("merge"):
+            output = collect_deltas(payloads)
         self.assertEqual(output, first + "官方测试，比较适合判断能做什么。")
         self.assertEqual(output.count("## 二、"), 1)
 
@@ -98,10 +114,41 @@ class StreamTextDedupTests(unittest.TestCase):
             payloads.append(message_event("\n\n" + header + "\n\n" + para[:end], "msg-2"))
         payloads.append("[DONE]")
 
-        output = collect_deltas(payloads)
+        with variant_policy("merge"):
+            output = collect_deltas(payloads)
         self.assertEqual(output.count(header), 1)
         self.assertEqual(output.count("截至 2026 年 10 月"), 1)
         self.assertTrue(output.endswith(para))
+
+    def test_second_message_id_is_dropped_in_follow_first_mode(self) -> None:
+        first = "少爷，这是第一条消息的完整回答。"
+        variant = "少爷，这是另一份措辞不同的回答。"
+        payloads = [message_event(first, "msg-1"), message_event(variant, "msg-2"), "[DONE]"]
+
+        self.assertEqual(collect_deltas(payloads), first)
+
+    def test_interleaving_from_production_log_yields_one_answer(self) -> None:
+        # 线上日志里的真实交替节奏：A 25 → B 25 → B 222 → A 280 → B 280 → …
+        common = "少爷，先说结论：这条路线更划算。" * 4
+        answer_a = common + "A 的后续内容。" * 40
+        answer_b = common + "B 的后续内容。" * 40
+
+        payloads = [
+            message_event(answer_a[:25], "msg-a"),
+            message_event(answer_b[:25], "msg-b"),
+            message_event(answer_b[:222], "msg-b"),
+            message_event(answer_a[:280], "msg-a"),
+            message_event(answer_b[:280], "msg-b"),
+            message_event(answer_a[:299], "msg-a"),
+            message_event(answer_b[:299], "msg-b"),
+            message_event("标题", "msg-c"),
+            message_event(answer_a[:306], "msg-a"),
+            message_event(answer_a, "msg-a"),
+            message_event(answer_b, "msg-b"),
+            "[DONE]",
+        ]
+
+        self.assertEqual(collect_deltas(payloads), answer_a)
 
     def test_history_replay_is_skipped(self) -> None:
         previous = "上一轮的回答。"
