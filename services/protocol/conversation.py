@@ -210,39 +210,52 @@ def message_text(content: Any) -> str:
     return ""
 
 
+def needs_global_system(messages: list[dict[str, Any]]) -> bool:
+    """normalize_messages also runs inside conversation_events, on messages the protocol
+    layer already normalized. Adding the global system prompt a second time sends the same
+    system turn twice, which models tend to mirror back as duplicated instructions."""
+    prompt = str(config.global_system_prompt or "")
+    if not prompt:
+        return False
+    if not messages:
+        return True
+    first = messages[0]
+    if str(first.get("role") or "") != "system":
+        return True
+    return message_text(first.get("content")) != prompt
+
+
 def normalize_messages(messages: object, system: Any = None) -> list[dict[str, Any]]:
+    source = [message for message in messages if isinstance(message, dict)] if isinstance(messages, list) else []
     normalized = []
-    if config.global_system_prompt:
+    if needs_global_system(source):
         normalized.append({"role": "system", "content": config.global_system_prompt})
     system_text = message_text(system)
     if system_text:
         normalized.append({"role": "system", "content": system_text})
-    if isinstance(messages, list):
-        for message in messages:
-            if not isinstance(message, dict):
-                continue
-            role = message.get("role", "user")
-            content = message.get("content", "")
-            text = message_text(content)
-            images: list[tuple[bytes, str]] = []
-            if role == "user":
-                images.extend(extract_image_from_message_content(content))
-                if isinstance(content, list):
-                    for part in content:
-                        if not isinstance(part, dict) or part.get("type") != "image":
-                            continue
-                        data = part.get("data")
-                        if isinstance(data, (bytes, bytearray)) and all(existing[0] != bytes(data) for existing in images):
-                            images.append((bytes(data), str(part.get("mime") or "image/png")))
-            if images:
-                parts: list[Any] = []
-                if text:
-                    parts.append({"type": "text", "text": text})
-                for data, mime in images:
-                    parts.append({"type": "image", "data": data, "mime": mime})
-                normalized.append({"role": role, "content": parts})
-            else:
-                normalized.append({"role": role, "content": text})
+    for message in source:
+        role = message.get("role", "user")
+        content = message.get("content", "")
+        text = message_text(content)
+        images: list[tuple[bytes, str]] = []
+        if role == "user":
+            images.extend(extract_image_from_message_content(content))
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict) or part.get("type") != "image":
+                        continue
+                    data = part.get("data")
+                    if isinstance(data, (bytes, bytearray)) and all(existing[0] != bytes(data) for existing in images):
+                        images.append((bytes(data), str(part.get("mime") or "image/png")))
+        if images:
+            parts: list[Any] = []
+            if text:
+                parts.append({"type": "text", "text": text})
+            for data, mime in images:
+                parts.append({"type": "image", "data": data, "mime": mime})
+            normalized.append({"role": role, "content": parts})
+        else:
+            normalized.append({"role": role, "content": text})
     return normalized
 
 
@@ -355,8 +368,11 @@ class ConversationRequest:
 
 @dataclass
 class ConversationState:
+    # `text` follows what the client has actually received (deltas are append-only),
+    # while `raw_text` follows the upstream text of the message currently streaming.
     text: str = ""
     raw_text: str = ""
+    message_id: str = ""
     conversation_id: str = ""
     file_ids: list[str] = field(default_factory=list)
     sediment_ids: list[str] = field(default_factory=list)
@@ -432,6 +448,47 @@ def strip_history(text: str, history_text: str = "") -> str:
     return text
 
 
+def common_prefix_length(left: str, right: str) -> int:
+    limit = min(len(left), len(right))
+    index = 0
+    while index < limit and left[index] == right[index]:
+        index += 1
+    return index
+
+
+OVERLAP_SCAN_LIMIT = 160
+MIN_CONTAINED_LENGTH = 4
+
+
+def emitted_prefix_length(emitted: str, snapshot: str) -> int:
+    """How much of `snapshot`'s head the client has already received.
+
+    Deltas are append-only, so anything the client already has must never be sent again.
+    Upstream repeats text in three shapes, all of which show up as a snapshot that is not a
+    plain extension of what was streamed:
+
+    * the whole answer restarts from the greeting (regeneration / parallel variant),
+    * the answer restarts at a section that was already streamed (`## 二、...`),
+    * the earlier text is rewritten by sanitize_output_text, e.g. a collapsed space.
+
+    A contained snapshot is fully covered. Otherwise the snapshot either extends the emitted
+    text (common prefix) or re-takes a region the answer already ended with (the emitted
+    tail is a prefix of the snapshot).
+    """
+    if not snapshot:
+        return 0
+    if len(snapshot) >= MIN_CONTAINED_LENGTH and snapshot in emitted:
+        return len(snapshot)
+    covered = common_prefix_length(emitted, snapshot)
+    limit = min(len(snapshot), len(emitted), OVERLAP_SCAN_LIMIT)
+    while limit > covered:
+        if emitted.endswith(snapshot[:limit]):
+            covered = limit
+            break
+        limit -= 1
+    return covered
+
+
 def sanitize_output_text(text: str) -> str:
     text = str(text or "")
 
@@ -504,6 +561,19 @@ def event_assistant_text(event: dict[str, Any], history_text: str = "") -> str:
         message = candidate.get("message")
         if isinstance(message, dict) and (message.get("author") or {}).get("role") == "assistant":
             return strip_history(assistant_message_text(message), history_text)
+    return ""
+
+
+def event_assistant_message_id(event: dict[str, Any]) -> str:
+    for candidate in (event, event.get("v")):
+        if not isinstance(candidate, dict):
+            continue
+        message = candidate.get("message")
+        if not isinstance(message, dict):
+            continue
+        if str((message.get("author") or {}).get("role") or "").strip().lower() != "assistant":
+            continue
+        return str(message.get("id") or message.get("message_id") or "")
     return ""
 
 
@@ -682,14 +752,28 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
             state.raw_text = ""
             state.text = ""
             continue
+        message_id = event_assistant_message_id(event)
+        if message_id and message_id != state.message_id:
+            # ChatGPT opened a new assistant message for this turn (a regeneration or a
+            # parallel variant). The patches that follow describe that new message, so the
+            # append base has to start over instead of growing the previous message's text.
+            state.message_id = message_id
+            state.raw_text = ""
         next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
         next_text = sanitize_output_text(next_raw_text)
         state.raw_text = next_raw_text
-        if next_text != state.text:
-            delta = next_text[len(state.text):] if next_text.startswith(state.text) else next_text
-            state.text = next_text
-            yield conversation_base_event("conversation.delta", state, raw=event, delta=delta)
-            continue
+        emitted_text = state.text
+        if next_text != emitted_text:
+            # Only ever send what the client does not have yet. Emitting the whole snapshot
+            # when it is not an extension of the emitted text replays everything already
+            # sent, and because `text` would then hold both copies every later snapshot
+            # misses the prefix test too, so the duplication cascades to the end of the
+            # answer. `emitted_prefix_length` keeps the genuine new tail in every case.
+            delta = next_text[emitted_prefix_length(emitted_text, next_text):]
+            if delta:
+                state.text = emitted_text + delta
+                yield conversation_base_event("conversation.delta", state, raw=event, delta=delta)
+                continue
         yield conversation_base_event("conversation.event", state, raw=event)
 
 
