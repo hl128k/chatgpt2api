@@ -152,6 +152,21 @@ class StreamTextDedupTests(unittest.TestCase):
         self.assertEqual(len(output), max(len(answer_a), len(answer_b)))
         self.assertTrue(output.endswith(answer_b[-12:]))
 
+    def test_stream_stops_when_upstream_marks_the_message_finished(self) -> None:
+        # 上游写完一条消息后会长时间保持连接，只等 [DONE] 会让客户端在答案完整后干等。
+        finished = json.dumps({"o": "add", "v": {"message": {
+            "id": "m1",
+            "author": {"role": "assistant"},
+            "status": "finished_successfully",
+            "content": {"content_type": "text", "parts": ["第一段。"]},
+        }}})
+        payloads = [message_event("第一段。", "m1"), finished, message_event("不该被读到", "m1")]
+
+        events = list(iter_conversation_payloads(iter(payloads), stop_on_finish=True))
+        text = "".join(str(event.get("delta") or "") for event in events if event.get("type") == "conversation.delta")
+        self.assertEqual(text, "第一段。")
+        self.assertEqual(sum(1 for event in events if event.get("type") == "conversation.done"), 1)
+
     def test_history_replay_is_skipped(self) -> None:
         previous = "上一轮的回答。"
         payloads = [

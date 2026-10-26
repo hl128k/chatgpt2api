@@ -397,6 +397,7 @@ class MessageStream:
     text: str = ""
     tail_confirmed: bool = False
     shadow: bool = False
+    finished: bool = False
 
 
 @dataclass
@@ -686,6 +687,27 @@ def event_assistant_message_id(event: dict[str, Any]) -> str:
     return ""
 
 
+def finished_message_id(event: dict[str, Any]) -> str | None:
+    """上游标记「这条消息写完了」时返回它的 id（空串表示归属当前消息），否则返回 None。
+
+    上游写完一条消息后会长时间保持连接（并行变体时尤其明显），只等 `[DONE]` 会让客户端
+    在答案已经完整之后还干等，所以这里把完成信号拿出来用于主动收尾。
+    """
+    for candidate in (event, event.get("v")):
+        if not isinstance(candidate, dict):
+            continue
+        message = candidate.get("message")
+        if not isinstance(message, dict):
+            continue
+        if str((message.get("author") or {}).get("role") or "").strip().lower() != "assistant":
+            continue
+        if str(message.get("status") or "") == "finished_successfully" or message.get("end_turn") is True:
+            return str(message.get("id") or message.get("message_id") or "")
+    if event.get("p") == "/message/status" and event.get("v") == "finished_successfully":
+        return ""
+    return None
+
+
 def apply_text_patch(event: dict[str, Any], current_text: str = "", history_text: str = "") -> str:
     if event.get("p") == "/message/content/parts/0":
         return apply_patch_op(event, current_text, history_text)
@@ -835,7 +857,8 @@ def conversation_base_event(event_type: str, state: ConversationState, **extra: 
 
 
 def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
-                               history_messages: list[str] | None = None) -> Iterator[dict[str, Any]]:
+                               history_messages: list[str] | None = None,
+                               stop_on_finish: bool = False) -> Iterator[dict[str, Any]]:
     state = ConversationState()
     history_messages = history_messages or []
     history_index = 0
@@ -879,56 +902,68 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
         next_raw_text = assistant_raw_text(event, stream.raw, history_text)
         next_text = sanitize_output_text(next_raw_text)
         stream.raw = next_raw_text
-        if stream.shadow or next_text == stream.text:
-            yield conversation_base_event("conversation.event", state, raw=event)
-            continue
+        finished_id = finished_message_id(event)
+        if finished_id is not None:
+            finished_stream = streams.get(finished_id or stream_key)
+            if finished_stream is not None:
+                finished_stream.finished = True
 
-        previous_text = stream.text
-        stream.text = next_text
-        emitted_text = state.text
-        policy = config.stream_variant_policy
+        delta = ""
+        if not stream.shadow and next_text != stream.text:
+            previous_text = stream.text
+            stream.text = next_text
+            emitted_text = state.text
+            policy = config.stream_variant_policy
+            skip = False
+            if policy == "follow_first" and primary_message is not None and stream_key != primary_message:
+                # 本轮已锁定一条消息，其他 id 是并行变体：整条忽略。
+                stream.shadow = True
+                log_stream_variant(state, stream, next_text, emitted_text)
+                skip = True
+            elif policy == "extend" and leader_message is not None and stream_key != leader_message:
+                leader = streams.get(leader_message)
+                if leader is None or len(next_text) <= len(leader.text) + VARIANT_SWITCH_MARGIN:
+                    # 明显落后于当前跟的那条，先不发；等它真的更长再切过去。
+                    skip = True
+                else:
+                    log_stream_switch(state, leader, stream, len(emitted_text))
+                    leader_message = stream_key
 
-        if policy == "follow_first" and primary_message is not None and stream_key != primary_message:
-            # 本轮已锁定一条消息，其他 id 是并行变体：整条忽略。
-            stream.shadow = True
-            log_stream_variant(state, stream, next_text, emitted_text)
-            yield conversation_base_event("conversation.event", state, raw=event)
-            continue
-        if policy == "extend" and leader_message is not None and stream_key != leader_message:
-            leader = streams.get(leader_message)
-            if leader is None or len(next_text) <= len(leader.text) + VARIANT_SWITCH_MARGIN:
-                # 明显落后于当前跟的那条，先不发；等它真的更长再切过去。
-                yield conversation_base_event("conversation.event", state, raw=event)
-                continue
-            log_stream_switch(state, leader, stream, len(emitted_text))
-            leader_message = stream_key
+            if not skip:
+                if policy == "extend":
+                    # 只补「已发长度」之后的差额：并行两条消息时既不会重复，也不会把后到的那份丢掉。
+                    delta = next_text[len(emitted_text):] if len(next_text) > len(emitted_text) else ""
+                elif stream.tail_confirmed and next_text.startswith(previous_text):
+                    # 同一条消息在变长，而且客户端当前的结尾正是这条消息上一次的快照：
+                    # 快照之间的前缀关系是协议保证的，直接取差额即可。
+                    delta = next_text[len(previous_text):]
+                else:
+                    # 换了消息、这条消息被改写、或者上一次的内容并不是由这条消息追加的：
+                    # 只发客户端还没有的部分。
+                    covered = emitted_prefix_length(emitted_text, next_text)
+                    delta = next_text[covered:]
+                    log_stream_join(state, stream, next_text, emitted_text, covered)
 
-        if policy == "extend":
-            # 只补「已发长度」之后的差额：并行两条消息时既不会重复，也不会把后到的那份丢掉。
-            delta = next_text[len(emitted_text):] if len(next_text) > len(emitted_text) else ""
-        elif stream.tail_confirmed and next_text.startswith(previous_text):
-            # 同一条消息在变长，而且客户端当前的结尾正是这条消息上一次的快照：
-            # 快照之间的前缀关系是协议保证的，直接取差额即可。
-            delta = next_text[len(previous_text):]
-        else:
-            # 换了消息、这条消息被改写、或者上一次的内容并不是由这条消息追加的：
-            # 只发客户端还没有的部分。
-            covered = emitted_prefix_length(emitted_text, next_text)
-            delta = next_text[covered:]
-            log_stream_join(state, stream, next_text, emitted_text, covered)
+                if delta:
+                    if policy == "extend" and leader_message is None:
+                        leader_message = stream_key
+                    if policy == "follow_first" and primary_message is None:
+                        # 第一条真正产出内容的消息就是本轮的主消息。
+                        primary_message = stream_key
+                    state.text = emitted_text + delta
+                stream.tail_confirmed = state.text.endswith(next_text)
 
-        if delta:
-            if policy == "extend" and leader_message is None:
-                leader_message = stream_key
-            if policy == "follow_first" and primary_message is None:
-                # 第一条真正产出内容的消息就是本轮的主消息。
-                primary_message = stream_key
-            state.text = emitted_text + delta
-        stream.tail_confirmed = state.text.endswith(next_text)
         if delta:
             yield conversation_base_event("conversation.delta", state, raw=event, delta=delta)
-            continue
-        yield conversation_base_event("conversation.event", state, raw=event)
+        else:
+            yield conversation_base_event("conversation.event", state, raw=event)
+
+        if stop_on_finish and streams and all(
+            item.finished for item in streams.values() if not item.shadow
+        ):
+            # 上游已经把这条（或这些）消息标记为完成，不必再等它关连接。
+            yield conversation_base_event("conversation.done", state, done=True)
+            break
 
 
 def conversation_events(
@@ -954,7 +989,9 @@ def conversation_events(
         system_hints=["picture_v2"] if image_model else None,
         thinking_effort=thinking_effort if not image_model else "",
     )
-    yield from iter_conversation_payloads(payloads, history_text, history_messages)
+    yield from iter_conversation_payloads(
+        payloads, history_text, history_messages, stop_on_finish=not image_model
+    )
 
 
 def text_backend() -> OpenAIBackendAPI:
@@ -965,6 +1002,9 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "")
     emitted = False
+    started_at = time.monotonic()
+    last_delta_at = 0.0
+    delta_count = 0
     had_deadline = hasattr(backend, "request_deadline")
     previous_deadline = getattr(backend, "request_deadline", None)
     try:
@@ -994,6 +1034,8 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                     delta = str(event.get("delta") or "")
                     if delta:
                         emitted = True
+                        delta_count += 1
+                        last_delta_at = time.monotonic()
                         yield delta
                 account_service.mark_text_used(token)
                 return
@@ -1013,6 +1055,18 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 if active_backend is not None:
                     active_backend.close()
     finally:
+        if emitted:
+            # `tail_gap_ms` 是「最后一次吐出文本」到「流真正结束」之间的间隔，
+            # 客户端感觉到的"卡着"就是这个值。
+            try:
+                logger.info({
+                    "event": "text_stream_metrics",
+                    "deltas": delta_count,
+                    "total_ms": int((time.monotonic() - started_at) * 1000),
+                    "tail_gap_ms": int((time.monotonic() - last_delta_at) * 1000) if last_delta_at else 0,
+                })
+            except Exception:
+                pass
         if had_deadline:
             backend.request_deadline = previous_deadline
         elif hasattr(backend, "request_deadline"):

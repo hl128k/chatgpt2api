@@ -72,16 +72,15 @@ def convert_void_tag(name: str, attributes: dict[str, str]) -> str:
     return ""
 
 
-def is_incomplete_component_tag(text: str, index: int) -> bool:
-    """流式输出可能把标签切开（`<AsyncImage query="mini`），此时先别吐出半截标签。
-
-    只在 `_TAG_RE` 已经匹配失败后调用，所以走到这里基本可以认定标签还没收尾。
-    超过 `MAX_PENDING_TAG_LENGTH` 就不再等待，避免正文里出现 `<box` 字样时把后文吃掉。
-    """
-    if len(text) - index > MAX_PENDING_TAG_LENGTH:
-        return False
+def is_component_tag_name(text: str, index: int) -> bool:
+    """判断 `<` 后面跟的是不是组件名（含被写残的前缀，例如 `<Async`）。"""
     match = _TAG_NAME_RE.match(text, index)
-    return bool(match) and match.group(1).lower() in COMPONENT_TAGS
+    if not match:
+        return False
+    name = match.group(1).lower()
+    if name in COMPONENT_TAGS:
+        return True
+    return len(name) >= 3 and any(tag.startswith(name) for tag in COMPONENT_TAGS)
 
 
 def collapse_blank_lines(text: str) -> str:
@@ -178,9 +177,15 @@ def strip_ui_markup(text: str) -> str:
                         emit("**")
                     index = match.end()
                     continue
-            if is_incomplete_component_tag(text, index):
-                # 标签还没收尾（流式输出被切开），先不吐出半截标签。
-                break
+            if is_component_tag_name(text, index):
+                line_end = text.find("\n", index)
+                if 0 <= line_end - index <= MAX_PENDING_TAG_LENGTH:
+                    # 组件名后面没闭合就换行了：这是上游写残的标签，整行丢掉，保留后面的正文。
+                    index = line_end + 1
+                    continue
+                if len(text) - index <= MAX_PENDING_TAG_LENGTH:
+                    # 还没换行也没闭合，可能是流式切开，先扣住不发。
+                    break
             emit("<")
             index += 1
             continue

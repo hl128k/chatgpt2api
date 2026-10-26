@@ -58,6 +58,14 @@ class UiMarkupTests(unittest.TestCase):
         self.assertEqual(strip_ui_markup("前文 <box gap={3"), "前文")
         self.assertEqual(strip_ui_markup("前文 <AsyncImage query=\"mini"), "前文")
 
+    def test_broken_tag_on_its_own_line_keeps_the_following_content(self) -> None:
+        # 线上实际出现过：上游只写出 `<Async` 就换行，后面紧跟表格。
+        source = "目标总价：约 6,500 元\n<Async\n| 建议规格 |\n|---|---|\n| 显卡 | RTX 5060 Ti |"
+        self.assertEqual(
+            strip_ui_markup(source),
+            "目标总价：约 6,500 元\n| 建议规格 |\n|---|---|\n| 显卡 | RTX 5060 Ti |",
+        )
+
     def test_arrow_function_attribute_does_not_break_the_tag(self) -> None:
         source = '<button block onClick={() => GenUI.issueNewTurn("帮我选配置")}>帮我选具体配置</button>'
         self.assertEqual(strip_ui_markup(source), "帮我选具体配置")

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
++ [优化] 文本流在上游把消息标记为完成后立即收尾，不再等它自己关闭连接；新增 `text_stream_metrics` 日志，其中 `tail_gap_ms` 就是「最后一段文本到流结束」的间隔，用于定位收尾等待。
++ [修复] 上游写残的组件标签（例如只写出 `<Async` 就换行）不再漏进正文，同一行之后的表格等内容保留。
+
 + [修复] 并行生成的两条消息里有一条提前停住时，答案不再被截断：`extend` 策略（新默认）只补已发长度之后的差额，另一条继续写的内容会接上，同时不会重复。
 + [新增] `stream_variant_policy` 新增 `extend` 取值并设为默认；`follow_first`（只跟第一条，可能截断）和 `merge`（内容对齐拼接，可能重复）保留可选。
 + [新增] `upstream_variant_purpose`：可配置上游 `variant_purpose`。设为空字符串即不发送该字段；`comparison_implicit` 会让 ChatGPT 为同一轮并发生成两条回答。
