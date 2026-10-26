@@ -386,12 +386,19 @@ class MessageStream:
 
     同一条消息的后续事件只会把文本变长，所以「新增部分 = 新快照减去旧快照」是精确的；
     只有消息被改写、或者换了另一条消息时，才需要和已发文本做对齐。
+
+    `shadow` 用于并行变体：上游可能为同一轮同时生成两条内容几乎相同的消息（见
+    `variant_purpose`），其中一条的内容一旦和已发文本完全重合，就把整条消息忽略掉，
+    否则两份答案会交替追加进同一个输出里。
     """
 
     message_id: str = ""
     raw: str = ""
     text: str = ""
     tail_confirmed: bool = False
+    shadow: bool = False
+    suspect: bool = False
+    emitted_chars: int = 0
 
 
 @dataclass
@@ -470,6 +477,7 @@ def common_prefix_length(left: str, right: str) -> int:
 
 
 MIN_CONTAINED_LENGTH = 4
+MIN_VARIANT_SNAPSHOT_LENGTH = 8
 ANCHOR_PROBE_SIZES = (64, 32, 16, 8)
 
 
@@ -552,6 +560,47 @@ def log_stream_join(state: ConversationState, stream: MessageStream, snapshot: s
             logger.debug(payload)
     except Exception:
         pass
+
+
+def log_stream_variant(state: ConversationState, stream: MessageStream,
+                       snapshot: str, emitted: str) -> None:
+    """记录一条被忽略的并行变体。上游 `variant_purpose=comparison_implicit` 会同时生成两条。"""
+    try:
+        logger.info({
+            "event": "stream_text_variant_shadowed",
+            "message_id": stream.message_id,
+            "conversation_id": state.conversation_id,
+            "snapshot_length": len(snapshot),
+            "emitted_length": len(emitted),
+        })
+    except Exception:
+        pass
+
+
+def log_stream_suspect(state: ConversationState, stream: MessageStream,
+                       snapshot: str, emitted: str) -> None:
+    """记录一条「内容已经发过、暂时不知道是变体还是重新生成」的消息。"""
+    try:
+        logger.debug({
+            "event": "stream_text_variant_suspect",
+            "message_id": stream.message_id,
+            "conversation_id": state.conversation_id,
+            "snapshot_length": len(snapshot),
+            "emitted_length": len(emitted),
+        })
+    except Exception:
+        pass
+
+
+def shadow_pending_streams(state: ConversationState, streams: dict[str, MessageStream],
+                           active: MessageStream) -> None:
+    """有消息正在产出新内容，说明之前挂起的那条是并行变体，整条丢掉。"""
+    for other in streams.values():
+        if other is active or not other.suspect:
+            continue
+        other.suspect = False
+        other.shadow = True
+        log_stream_variant(state, other, other.text, state.text)
 
 
 def sanitize_output_text(text: str) -> str:
@@ -832,12 +881,23 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
         next_raw_text = assistant_raw_text(event, stream.raw, history_text)
         next_text = sanitize_output_text(next_raw_text)
         stream.raw = next_raw_text
-
-        emitted_text = state.text
-        if next_text == stream.text:
-            # 同一条消息的重复快照，没有新内容。
+        if stream.shadow or next_text == stream.text:
             yield conversation_base_event("conversation.event", state, raw=event)
             continue
+
+        emitted_text = state.text
+        if (
+            not stream.suspect
+            and stream.emitted_chars == 0
+            and len(next_text) >= MIN_VARIANT_SNAPSHOT_LENGTH
+            and config.stream_variant_policy == "follow_first"
+            and emitted_prefix_length(emitted_text, next_text) >= len(next_text)
+        ):
+            # 这条消息的内容已经完整发过了：可能只是并行变体，也可能是一次「重新生成」。
+            # 先挂起不输出，等下一帧再判断——期间若另一条消息还在产出，它就是变体。
+            stream.suspect = True
+            log_stream_suspect(state, stream, next_text, emitted_text)
+
         if stream.tail_confirmed and next_text.startswith(stream.text):
             # 同一条消息在变长，而且客户端当前的结尾正是这条消息上一次的快照：
             # 快照之间的前缀关系是协议保证的，直接取差额即可。
@@ -850,7 +910,11 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
             log_stream_join(state, stream, next_text, emitted_text, covered)
         stream.text = next_text
         if delta:
+            # 它开始产出新内容了，说明之前只是「还没写完」，不是变体。
+            stream.suspect = False
+            shadow_pending_streams(state, streams, stream)
             state.text = emitted_text + delta
+            stream.emitted_chars += len(delta)
         stream.tail_confirmed = state.text.endswith(next_text)
         if delta:
             yield conversation_base_event("conversation.delta", state, raw=event, delta=delta)

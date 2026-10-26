@@ -551,6 +551,28 @@ class ConfigStore:
         return bool(value)
 
     @property
+    def stream_variant_policy(self) -> str:
+        """上游并行生成多条消息时的处理策略。
+
+        - `follow_first`：只跟第一条，内容已在输出里的并行变体整条忽略（默认，不会重复）
+        - `merge`：把变体也拼进输出（可能重复）
+        """
+        value = str(self.data.get("stream_variant_policy") or "").strip().lower()
+        return value if value in {"follow_first", "merge"} else "follow_first"
+
+    @property
+    def upstream_variant_purpose(self) -> str:
+        """上游 conversation 请求里的 `variant_purpose`。
+
+        `comparison_implicit` 会让 ChatGPT 为同一轮并行生成两条回答，这也是流式输出里
+        出现两份内容的原因。配成空字符串表示不发送这个字段。
+        """
+        value = self.data.get("upstream_variant_purpose")
+        if value is None:
+            return "comparison_implicit"
+        return str(value).strip()
+
+    @property
     def auto_remove_rate_limited_accounts(self) -> bool:
         value = self.data.get("auto_remove_rate_limited_accounts", False)
         if isinstance(value, str):

@@ -48,20 +48,22 @@ class StreamTextDedupTests(unittest.TestCase):
 
         self.assertEqual(collect_deltas(payloads), answer)
 
-    def test_interleaved_variants_do_not_repeat_the_whole_answer(self) -> None:
-        variant_a = "少爷，A 方案更省心。"
-        variant_b = "少爷，A 方案更省心，B 方案更快。"
+    def test_parallel_variant_is_shadowed(self) -> None:
+        # 上游 variant_purpose=comparison_implicit 会并行生成两条高度相似的消息，
+        # 它们交替推送快照；只能跟其中一条，否则两份答案会拼在一起。
+        variant_a = "少爷，A 方案更省心，适合长期运行。"
+        variant_b = "少爷，A 方案更省心，适合长期运行，B 方案更快。"
         payloads = [
-            message_event(variant_a[:6], "msg-a"),
-            message_event(variant_b[:6], "msg-b"),
+            message_event(variant_a[:8], "msg-a"),
+            message_event(variant_b[:8], "msg-b"),
+            message_event(variant_a[:16], "msg-a"),
+            message_event(variant_b[:16], "msg-b"),
             message_event(variant_a, "msg-a"),
             message_event(variant_b, "msg-b"),
             "[DONE]",
         ]
 
-        output = collect_deltas(payloads)
-        self.assertLessEqual(output.count("少爷"), 1)
-        self.assertTrue(output.endswith("B 方案更快。"))
+        self.assertEqual(collect_deltas(payloads), variant_a)
 
     def test_shrinking_snapshot_does_not_duplicate_streamed_text(self) -> None:
         payloads = [

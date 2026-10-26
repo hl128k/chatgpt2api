@@ -38,6 +38,8 @@
   "sensitive_words": [],
   "global_system_prompt": "",
   "strip_ui_markup": true,
+  "stream_variant_policy": "follow_first",
+  "upstream_variant_purpose": "comparison_implicit",
   "ai_review": {
     "enabled": false,
     "base_url": "",

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
++ [新增] `stream_variant_policy`：上游为同一轮并行生成多条消息时的策略。默认 `follow_first` 只跟其中一条，内容已在输出里的变体整条忽略；改成 `merge` 恢复原来的拼接行为。
++ [新增] `upstream_variant_purpose`：可配置上游 `variant_purpose`。设为空字符串即不发送该字段；`comparison_implicit` 会让 ChatGPT 为同一轮并发生成两条回答。
++ [新增] 变体识别日志 `stream_text_variant_suspect` / `stream_text_variant_shadowed`，用于确认上游是否在并行生成。
 + [优化] 流式文本改为按消息分别记账：同一条消息内直接取快照差额，只有换消息、内容被改写或上次内容不是这条消息追加时才和已发文本做对齐。
 + [新增] 拼接日志 `stream_text_join`，记录已发长度、重合长度和追加长度；发生在同一条消息内时按 info 输出，便于确认上游是否在改写已生成的内容。
 + [修复] 文本流式去重改为在已发文本中定位重来段落的起点，并且比较时忽略快照的前导空行；上游从段落标题重来时不再重复输出（首段贴着上一句、后续快照带空行的场景）。
