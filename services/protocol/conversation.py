@@ -369,17 +369,29 @@ class ConversationRequest:
 
 @dataclass
 class ConversationState:
-    # `text` follows what the client has actually received (deltas are append-only),
-    # while `raw_text` follows the upstream text of the message currently streaming.
+    # `text` follows what the client has actually received: deltas are append-only, so it
+    # only ever grows, even when upstream rewrites what it is generating.
     text: str = ""
-    raw_text: str = ""
-    message_id: str = ""
     conversation_id: str = ""
     file_ids: list[str] = field(default_factory=list)
     sediment_ids: list[str] = field(default_factory=list)
     blocked: bool = False
     tool_invoked: bool | None = None
     turn_use_case: str = ""
+
+
+@dataclass
+class MessageStream:
+    """上游单条 assistant 消息的快照状态。
+
+    同一条消息的后续事件只会把文本变长，所以「新增部分 = 新快照减去旧快照」是精确的；
+    只有消息被改写、或者换了另一条消息时，才需要和已发文本做对齐。
+    """
+
+    message_id: str = ""
+    raw: str = ""
+    text: str = ""
+    tail_confirmed: bool = False
 
 
 @dataclass
@@ -514,6 +526,32 @@ def emitted_prefix_length(emitted: str, snapshot: str) -> int:
     if covered <= 0:
         return 0
     return lead + covered
+
+
+def log_stream_join(state: ConversationState, stream: MessageStream, snapshot: str,
+                    emitted: str, covered: int) -> None:
+    """记录一次「新快照需要对已发文本做对齐」的拼接。
+
+    单条消息从头流到尾只会在这里记一条（新消息的第一份快照）；如果同一条消息反复出现，
+    说明上游在改写已经生成过的内容，日志里的 covered 就是两边的实际重合长度。
+    """
+    payload = {
+        "event": "stream_text_join",
+        "diverged": bool(stream.text),
+        "message_id": stream.message_id,
+        "conversation_id": state.conversation_id,
+        "snapshot_length": len(snapshot),
+        "emitted_length": len(emitted),
+        "covered_length": covered,
+        "appended_length": max(0, len(snapshot) - covered),
+    }
+    try:
+        if stream.text:
+            logger.info(payload)
+        else:
+            logger.debug(payload)
+    except Exception:
+        pass
 
 
 def sanitize_output_text(text: str) -> str:
@@ -759,6 +797,8 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
     state = ConversationState()
     history_messages = history_messages or []
     history_index = 0
+    streams: dict[str, MessageStream] = {}
+    current_message = ""
     for payload in payloads:
         # print(f"[upstream_sse] {payload}", flush=True)
         if not payload:
@@ -778,31 +818,43 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
         update_conversation_state(state, payload, event)
         if history_index < len(history_messages) and event_assistant_text(event, history_text) == history_messages[history_index]:
             history_index += 1
-            state.raw_text = ""
+            streams.clear()
+            current_message = ""
             state.text = ""
             continue
         message_id = event_assistant_message_id(event)
-        if message_id and message_id != state.message_id:
-            # ChatGPT opened a new assistant message for this turn (a regeneration or a
-            # parallel variant). The patches that follow describe that new message, so the
-            # append base has to start over instead of growing the previous message's text.
-            state.message_id = message_id
-            state.raw_text = ""
-        next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
+        if message_id:
+            current_message = message_id
+        stream = streams.get(current_message)
+        if stream is None:
+            stream = MessageStream(message_id=current_message)
+            streams[current_message] = stream
+        next_raw_text = assistant_raw_text(event, stream.raw, history_text)
         next_text = sanitize_output_text(next_raw_text)
-        state.raw_text = next_raw_text
+        stream.raw = next_raw_text
+
         emitted_text = state.text
-        if next_text != emitted_text:
-            # Only ever send what the client does not have yet. Emitting the whole snapshot
-            # when it is not an extension of the emitted text replays everything already
-            # sent, and because `text` would then hold both copies every later snapshot
-            # misses the prefix test too, so the duplication cascades to the end of the
-            # answer. `emitted_prefix_length` keeps the genuine new tail in every case.
-            delta = next_text[emitted_prefix_length(emitted_text, next_text):]
-            if delta:
-                state.text = emitted_text + delta
-                yield conversation_base_event("conversation.delta", state, raw=event, delta=delta)
-                continue
+        if next_text == stream.text:
+            # 同一条消息的重复快照，没有新内容。
+            yield conversation_base_event("conversation.event", state, raw=event)
+            continue
+        if stream.tail_confirmed and next_text.startswith(stream.text):
+            # 同一条消息在变长，而且客户端当前的结尾正是这条消息上一次的快照：
+            # 快照之间的前缀关系是协议保证的，直接取差额即可。
+            delta = next_text[len(stream.text):]
+        else:
+            # 换了消息、这条消息被改写、或者上一次的内容并不是由这条消息追加的：
+            # 只发客户端还没有的部分。
+            covered = emitted_prefix_length(emitted_text, next_text)
+            delta = next_text[covered:]
+            log_stream_join(state, stream, next_text, emitted_text, covered)
+        stream.text = next_text
+        if delta:
+            state.text = emitted_text + delta
+        stream.tail_confirmed = state.text.endswith(next_text)
+        if delta:
+            yield conversation_base_event("conversation.delta", state, raw=event, delta=delta)
+            continue
         yield conversation_base_event("conversation.event", state, raw=event)
 
 
