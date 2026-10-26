@@ -62,6 +62,13 @@ class UiMarkupTests(unittest.TestCase):
         source = '<button block onClick={() => GenUI.issueNewTurn("帮我选配置")}>帮我选具体配置</button>'
         self.assertEqual(strip_ui_markup(source), "帮我选具体配置")
 
+    def test_nested_braces_in_attribute(self) -> None:
+        source = (
+            '<button block onClick={() => GenUI.issueNewTurn("预算："+budget'
+            '+({"sdxl":"静态生图","flux":"Flux"}[workflow]))}>提交配置</button>'
+        )
+        self.assertEqual(strip_ui_markup(source), "提交配置")
+
     def test_plain_text_is_untouched(self) -> None:
         source = "普通文本，包含 a < b 这种比较符号。"
         self.assertEqual(strip_ui_markup(source), source)

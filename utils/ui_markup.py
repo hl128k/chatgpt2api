@@ -38,7 +38,7 @@ COMPONENT_TAGS = BLOCK_TAGS | BOLD_TAGS | INLINE_TAGS | VOID_TAGS
 
 _TAG_RE = re.compile(
     r"<(?P<closing>/)?(?P<name>[A-Za-z][\w-]*)"
-    r"(?P<attrs>(?:\s+(?:[^>\"'{]|\"[^\"]*\"|'[^']*'|\{[^{}]*\})*)?)"
+    r"(?P<attrs>(?:\s+(?:[^>\"'{]|\"[^\"]*\"|'[^']*'|\{(?:[^{}]|\{[^{}]*\})*\})*)?)"
     r"(?P<selfclose>/)?>"
 )
 

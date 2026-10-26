@@ -457,8 +457,19 @@ def common_prefix_length(left: str, right: str) -> int:
     return index
 
 
-OVERLAP_SCAN_LIMIT = 160
 MIN_CONTAINED_LENGTH = 4
+ANCHOR_PROBE_SIZES = (64, 32, 16, 8)
+
+
+def locate_snapshot_anchor(emitted: str, snapshot: str) -> int | None:
+    """在已发文本里找快照开头的位置，用于对齐上游「重来」的那一段。"""
+    for size in ANCHOR_PROBE_SIZES:
+        if len(snapshot) < size:
+            continue
+        position = emitted.rfind(snapshot[:size])
+        if position >= 0:
+            return position
+    return None
 
 
 def emitted_prefix_length(emitted: str, snapshot: str) -> int:
@@ -472,22 +483,37 @@ def emitted_prefix_length(emitted: str, snapshot: str) -> int:
     * the answer restarts at a section that was already streamed (`## 二、...`),
     * the earlier text is rewritten by sanitize_output_text, e.g. a collapsed space.
 
-    A contained snapshot is fully covered. Otherwise the snapshot either extends the emitted
-    text (common prefix) or re-takes a region the answer already ended with (the emitted
-    tail is a prefix of the snapshot).
+    The snapshot is compared with its leading whitespace removed: the first snapshot of a
+    retake is often glued to the previous sentence while every later one starts with blank
+    lines, and a byte-exact comparison made all of them look like brand new text. When the
+    snapshot starts earlier than the end of the emitted text, the head is located inside it
+    instead of only at the tail, which is what a section retake looks like.
     """
     if not snapshot:
         return 0
-    if len(snapshot) >= MIN_CONTAINED_LENGTH and snapshot in emitted:
+    stripped = snapshot.lstrip()
+    if not stripped:
+        # Only whitespace: let it through as the separator it is.
+        return 0
+    lead = len(snapshot) - len(stripped)
+    body = stripped.rstrip()
+
+    if len(body) >= MIN_CONTAINED_LENGTH and body in emitted:
         return len(snapshot)
-    covered = common_prefix_length(emitted, snapshot)
-    limit = min(len(snapshot), len(emitted), OVERLAP_SCAN_LIMIT)
-    while limit > covered:
-        if emitted.endswith(snapshot[:limit]):
-            covered = limit
-            break
-        limit -= 1
-    return covered
+
+    prefix = common_prefix_length(emitted, stripped)
+    if prefix >= len(emitted) or prefix >= len(stripped):
+        # 正常续写，或者快照本身就是已发文本的前缀。
+        return min(len(snapshot), lead + prefix)
+
+    # 上游从更早的位置重来：先在已发文本里定位快照开头，再按该位置算重叠长度。
+    covered = prefix
+    anchor = locate_snapshot_anchor(emitted, stripped)
+    if anchor is not None:
+        covered = max(covered, common_prefix_length(emitted[anchor:], stripped))
+    if covered <= 0:
+        return 0
+    return lead + covered
 
 
 def sanitize_output_text(text: str) -> str:

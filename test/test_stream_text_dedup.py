@@ -84,6 +84,23 @@ class StreamTextDedupTests(unittest.TestCase):
         self.assertEqual(output, first + "官方测试，比较适合判断能做什么。")
         self.assertEqual(output.count("## 二、"), 1)
 
+    def test_section_retake_with_leading_blank_lines_is_not_repeated(self) -> None:
+        header = "## 二、实际生图能力差多少？"
+        para = "截至 2026 年 10 月，AMD 已经把本地生图的支持做得比早期完善不少。"
+        payloads = [
+            message_event("这条路线也许比换整台电脑更划算。", "msg-1"),
+            # 第一次重来贴着上一句，后续快照都带前导空行。
+            message_event(header, "msg-2"),
+        ]
+        for end in (8, 20, len(para)):
+            payloads.append(message_event("\n\n" + header + "\n\n" + para[:end], "msg-2"))
+        payloads.append("[DONE]")
+
+        output = collect_deltas(payloads)
+        self.assertEqual(output.count(header), 1)
+        self.assertEqual(output.count("截至 2026 年 10 月"), 1)
+        self.assertTrue(output.endswith(para))
+
     def test_history_replay_is_skipped(self) -> None:
         previous = "上一轮的回答。"
         payloads = [
