@@ -476,6 +476,7 @@ def common_prefix_length(left: str, right: str) -> int:
 
 MIN_CONTAINED_LENGTH = 4
 ANCHOR_PROBE_SIZES = (64, 32, 16, 8)
+VARIANT_SWITCH_MARGIN = 32
 
 
 def locate_snapshot_anchor(emitted: str, snapshot: str) -> int | None:
@@ -555,6 +556,27 @@ def log_stream_join(state: ConversationState, stream: MessageStream, snapshot: s
             logger.info(payload)
         else:
             logger.debug(payload)
+    except Exception:
+        pass
+
+
+def log_stream_switch(state: ConversationState, previous: MessageStream,
+                      current: MessageStream, emitted_length: int) -> None:
+    """记录一次「换一条消息继续输出」。
+
+    `extend` 策略下，当前跟的那条停滞、另一条明显更长时切换过去；只补长度差额，
+    所以既不会重复发送，也不会把后到的那份内容丢掉。
+    """
+    try:
+        logger.info({
+            "event": "stream_text_variant_switch",
+            "conversation_id": state.conversation_id,
+            "from_message_id": previous.message_id,
+            "to_message_id": current.message_id,
+            "from_length": len(previous.text),
+            "to_length": len(current.text),
+            "emitted_length": emitted_length,
+        })
     except Exception:
         pass
 
@@ -820,6 +842,7 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
     streams: dict[str, MessageStream] = {}
     current_message = ""
     primary_message: str | None = None
+    leader_message: str | None = None
     for payload in payloads:
         # print(f"[upstream_sse] {payload}", flush=True)
         if not payload:
@@ -842,6 +865,7 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
             streams.clear()
             current_message = ""
             primary_message = None
+            leader_message = None
             state.text = ""
             continue
         message_id = event_assistant_message_id(event)
@@ -859,31 +883,44 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
             yield conversation_base_event("conversation.event", state, raw=event)
             continue
 
+        previous_text = stream.text
+        stream.text = next_text
         emitted_text = state.text
-        if (
-            primary_message is not None
-            and stream_key != primary_message
-            and config.stream_variant_policy == "follow_first"
-        ):
-            # 本轮已经锁定了一条消息，其他 id 是上游并行生成的变体：整条忽略。
+        policy = config.stream_variant_policy
+
+        if policy == "follow_first" and primary_message is not None and stream_key != primary_message:
+            # 本轮已锁定一条消息，其他 id 是并行变体：整条忽略。
             stream.shadow = True
             log_stream_variant(state, stream, next_text, emitted_text)
             yield conversation_base_event("conversation.event", state, raw=event)
             continue
+        if policy == "extend" and leader_message is not None and stream_key != leader_message:
+            leader = streams.get(leader_message)
+            if leader is None or len(next_text) <= len(leader.text) + VARIANT_SWITCH_MARGIN:
+                # 明显落后于当前跟的那条，先不发；等它真的更长再切过去。
+                yield conversation_base_event("conversation.event", state, raw=event)
+                continue
+            log_stream_switch(state, leader, stream, len(emitted_text))
+            leader_message = stream_key
 
-        if stream.tail_confirmed and next_text.startswith(stream.text):
+        if policy == "extend":
+            # 只补「已发长度」之后的差额：并行两条消息时既不会重复，也不会把后到的那份丢掉。
+            delta = next_text[len(emitted_text):] if len(next_text) > len(emitted_text) else ""
+        elif stream.tail_confirmed and next_text.startswith(previous_text):
             # 同一条消息在变长，而且客户端当前的结尾正是这条消息上一次的快照：
             # 快照之间的前缀关系是协议保证的，直接取差额即可。
-            delta = next_text[len(stream.text):]
+            delta = next_text[len(previous_text):]
         else:
             # 换了消息、这条消息被改写、或者上一次的内容并不是由这条消息追加的：
             # 只发客户端还没有的部分。
             covered = emitted_prefix_length(emitted_text, next_text)
             delta = next_text[covered:]
             log_stream_join(state, stream, next_text, emitted_text, covered)
-        stream.text = next_text
+
         if delta:
-            if primary_message is None:
+            if policy == "extend" and leader_message is None:
+                leader_message = stream_key
+            if policy == "follow_first" and primary_message is None:
                 # 第一条真正产出内容的消息就是本轮的主消息。
                 primary_message = stream_key
             state.text = emitted_text + delta

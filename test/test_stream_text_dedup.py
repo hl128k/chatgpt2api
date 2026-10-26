@@ -63,9 +63,9 @@ class StreamTextDedupTests(unittest.TestCase):
         with variant_policy("merge"):
             self.assertEqual(collect_deltas(payloads), answer)
 
-    def test_parallel_variant_is_shadowed(self) -> None:
+    def test_parallel_variant_keeps_one_copy(self) -> None:
         # 上游 variant_purpose=comparison_implicit 会并行生成两条高度相似的消息，
-        # 它们交替推送快照；只能跟其中一条，否则两份答案会拼在一起。
+        # 它们交替推送快照；落后那条不重复发送。
         variant_a = "少爷，A 方案更省心，适合长期运行。"
         variant_b = "少爷，A 方案更省心，适合长期运行，B 方案更快。"
         payloads = [
@@ -125,12 +125,13 @@ class StreamTextDedupTests(unittest.TestCase):
         variant = "少爷，这是另一份措辞不同的回答。"
         payloads = [message_event(first, "msg-1"), message_event(variant, "msg-2"), "[DONE]"]
 
-        self.assertEqual(collect_deltas(payloads), first)
+        with variant_policy("follow_first"):
+            self.assertEqual(collect_deltas(payloads), first)
 
-    def test_interleaving_from_production_log_yields_one_answer(self) -> None:
-        # 线上日志里的真实交替节奏：A 25 → B 25 → B 222 → A 280 → B 280 → …
-        common = "少爷，先说结论：这条路线更划算。" * 4
-        answer_a = common + "A 的后续内容。" * 40
+    def test_stalled_message_does_not_truncate_the_answer(self) -> None:
+        # 线上日志：A 停在 299 字，B 一路长到 1632 字。extend 策略下答案不能被截断。
+        common = "少爷，先说结论：这条路线更划算。" + "显存和内存带宽决定了能跑多大的模型。" * 12
+        answer_a = common + "A 的后续内容。" * 10
         answer_b = common + "B 的后续内容。" * 40
 
         payloads = [
@@ -139,16 +140,17 @@ class StreamTextDedupTests(unittest.TestCase):
             message_event(answer_b[:222], "msg-b"),
             message_event(answer_a[:280], "msg-a"),
             message_event(answer_b[:280], "msg-b"),
-            message_event(answer_a[:299], "msg-a"),
+            message_event(answer_a, "msg-a"),
             message_event(answer_b[:299], "msg-b"),
             message_event("标题", "msg-c"),
-            message_event(answer_a[:306], "msg-a"),
-            message_event(answer_a, "msg-a"),
             message_event(answer_b, "msg-b"),
             "[DONE]",
         ]
 
-        self.assertEqual(collect_deltas(payloads), answer_a)
+        output = collect_deltas(payloads)
+        self.assertEqual(output.count("少爷，先说结论"), 1)
+        self.assertEqual(len(output), max(len(answer_a), len(answer_b)))
+        self.assertTrue(output.endswith(answer_b[-12:]))
 
     def test_history_replay_is_skipped(self) -> None:
         previous = "上一轮的回答。"

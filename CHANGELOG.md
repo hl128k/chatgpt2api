@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-+ [新增] `stream_variant_policy`：上游为同一轮并行生成多条消息时的策略。默认 `follow_first` 在本轮锁定第一条产出内容的消息，其余 id 整条忽略；改成 `merge` 恢复原来的拼接行为。
++ [修复] 并行生成的两条消息里有一条提前停住时，答案不再被截断：`extend` 策略（新默认）只补已发长度之后的差额，另一条继续写的内容会接上，同时不会重复。
++ [新增] `stream_variant_policy` 新增 `extend` 取值并设为默认；`follow_first`（只跟第一条，可能截断）和 `merge`（内容对齐拼接，可能重复）保留可选。
 + [新增] `upstream_variant_purpose`：可配置上游 `variant_purpose`。设为空字符串即不发送该字段；`comparison_implicit` 会让 ChatGPT 为同一轮并发生成两条回答。
 + [新增] 变体日志 `stream_text_variant_shadowed`，用于确认上游是否在并行生成。
 + [优化] 流式文本改为按消息分别记账：同一条消息内直接取快照差额，只有换消息、内容被改写或上次内容不是这条消息追加时才和已发文本做对齐。

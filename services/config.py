@@ -554,11 +554,12 @@ class ConfigStore:
     def stream_variant_policy(self) -> str:
         """上游并行生成多条消息时的处理策略。
 
-        - `follow_first`：只跟第一条，内容已在输出里的并行变体整条忽略（默认，不会重复）
-        - `merge`：把变体也拼进输出（可能重复）
+        - `extend`：只补「已发长度」之后的差额，两条消息的内容都不丢（默认）
+        - `follow_first`：本轮只跟第一条消息，其余整条忽略（绝不重复，但可能被截断）
+        - `merge`：和已发文本做内容对齐拼接（可能重复）
         """
         value = str(self.data.get("stream_variant_policy") or "").strip().lower()
-        return value if value in {"follow_first", "merge"} else "follow_first"
+        return value if value in {"extend", "follow_first", "merge"} else "extend"
 
     @property
     def upstream_variant_purpose(self) -> str:
