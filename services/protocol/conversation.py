@@ -31,6 +31,7 @@ from utils.helper import (
 )
 from utils.image_tokens import count_image_content_tokens
 from utils.log import logger
+from utils.ui_markup import strip_ui_markup
 
 
 class ImageGenerationError(Exception):
@@ -531,6 +532,8 @@ def sanitize_output_text(text: str) -> str:
     text = re.sub(r"\ue200([^\ue201]*)\ue201", replace_annotation, text)
     text = re.sub(r"\ue200[^\ue201]*$", "", text)
     text = re.sub(r"\s+([.,;:!?])", r"\1", text)
+    if config.strip_ui_markup:
+        text = strip_ui_markup(text)
     return text
 
 

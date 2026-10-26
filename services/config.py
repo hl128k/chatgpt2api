@@ -543,6 +543,14 @@ class ConfigStore:
         return bool(value)
 
     @property
+    def strip_ui_markup(self) -> bool:
+        """把上游的组件标记（<box>/<row>/<AsyncImage> 等）降级为 Markdown。"""
+        value = self.data.get("strip_ui_markup", True)
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off"}
+        return bool(value)
+
+    @property
     def auto_remove_rate_limited_accounts(self) -> bool:
         value = self.data.get("auto_remove_rate_limited_accounts", False)
         if isinstance(value, str):
